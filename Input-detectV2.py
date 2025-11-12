@@ -283,10 +283,168 @@ def extract_form_inputs(base_url, html_content):
 
     return forms
 
+def extract_cookies(response):
+    """Extrae cookies que pueden ser vectores de ataque"""
+    cookies = []
+    for cookie in response.cookies:
+        cookie_data = {
+            'name': cookie.name,
+            'value': cookie.value,
+            'domain': cookie.domain,
+            'path': cookie.path,
+            'secure': cookie.secure,
+            'httponly': cookie.has_nonstandard_attr('HttpOnly')
+        }
+        cookies.append(cookie_data)
+    return cookies
+
+def extract_api_endpoints(html_content):
+    """Detecta posibles endpoints API en código JavaScript"""
+    api_patterns = [
+        r'fetch\(["\']([^"\']+)["\']',
+        r'axios\.[a-z]+\(["\']([^"\']+)["\']',
+        r'\.ajax\({[^}]*url:\s*["\']([^"\']+)["\']',
+        r'XMLHttpRequest.*open\(["\'][A-Z]+["\']\s*,\s*["\']([^"\']+)["\']',
+        r'/api/[a-zA-Z0-9/_-]+',
+        r'/v\d+/[a-zA-Z0-9/_-]+',  # endpoints versionados
+    ]
+    
+    endpoints = set()
+    for pattern in api_patterns:
+        matches = re.findall(pattern, html_content, re.IGNORECASE)
+        endpoints.update(matches)
+    
+    return list(endpoints)
+
+def extract_custom_headers(html_content):
+    """Busca referencias a headers HTTP personalizados en JS"""
+    header_patterns = [
+        r'headers:\s*{([^}]+)}',
+        r'setRequestHeader\(["\']([^"\']+)["\']',
+        r'Authorization["\']:\s*["\']([^"\']+)["\']',
+    ]
+    
+    headers = set()
+    for pattern in header_patterns:
+        matches = re.findall(pattern, html_content, re.IGNORECASE)
+        for match in matches:
+            # Extraer nombres de headers
+            header_names = re.findall(r'["\']([A-Za-z-]+)["\']', match)
+            headers.update(header_names)
+    
+    return list(headers)
+
+def analyze_input_validation(form_fields):
+    """Analiza atributos de validación client-side"""
+    validation_info = []
+    
+    for field in form_fields:
+        field_validation = {
+            'name': field['name'],
+            'type': field['type'],
+            'validations': {}
+        }
+        
+        # Atributos HTML5 de validación
+        validation_attrs = [
+            'required', 'pattern', 'minlength', 'maxlength', 
+            'min', 'max', 'step', 'accept'
+        ]
+        
+        for attr in validation_attrs:
+            if attr in field:
+                field_validation['validations'][attr] = field[attr]
+        
+        if field_validation['validations']:
+            validation_info.append(field_validation)
+    
+    return validation_info
+
+def extract_enhanced_form_inputs(base_url, html_content):
+    """Versión mejorada que captura más detalles"""
+    forms = []
+    if not html_content:
+        return forms
+
+    soup = BeautifulSoup(html_content, 'html.parser')
+
+    for form_tag in soup.find_all('form'):
+        form_action = form_tag.get('action', '')
+        full_action_url = urljoin(base_url, form_action)
+        form_method = form_tag.get('method', 'GET').upper()
+        form_enctype = form_tag.get('enctype', 'application/x-www-form-urlencoded')
+        
+        form_fields = []
+        
+        # Incluir también buttons con name (nuevo)
+        for input_tag in form_tag.find_all(['input', 'textarea', 'select', 'button']):
+            field_name = input_tag.get('name')
+            if field_name:
+                field_info = {
+                    'name': field_name,
+                    'type': input_tag.get('type', 'text'),
+                    'value': input_tag.get('value', ''),
+                    'hidden': input_tag.get('type') == 'hidden',
+                    # Atributos de validación (nuevo)
+                    'required': input_tag.has_attr('required'),
+                    'pattern': input_tag.get('pattern', ''),
+                    'minlength': input_tag.get('minlength', ''),
+                    'maxlength': input_tag.get('maxlength', ''),
+                    'accept': input_tag.get('accept', ''),  # Para file uploads
+                }
+                form_fields.append(field_info)
+        
+        if form_fields:
+            forms.append({
+                'action': full_action_url,
+                'method': form_method,
+                'enctype': form_enctype,  # Importante para file uploads
+                'fields': form_fields,
+                'has_file_upload': any(f['type'] == 'file' for f in form_fields)
+            })
+
+    return forms
+
+def detect_json_payloads(html_content):
+    """Detecta estructuras JSON que se envían en peticiones"""
+    json_patterns = [
+        r'JSON\.stringify\(({[^}]+})\)',
+        r'data:\s*({[^}]+})',
+        r'body:\s*JSON\.stringify\(([^)]+)\)',
+    ]
+    
+    json_structures = []
+    for pattern in json_patterns:
+        matches = re.findall(pattern, html_content, re.DOTALL)
+        json_structures.extend(matches)
+    
+    return json_structures
+
+def detect_websockets(html_content):
+    """Detecta uso de WebSockets"""
+    ws_pattern = r'new\s+WebSocket\(["\']([^"\']+)["\']'
+    matches = re.findall(ws_pattern, html_content)
+    return matches
+
+def detect_localstorage_usage(html_content):
+    """Detecta uso de localStorage/sessionStorage como fuente de datos"""
+    storage_patterns = [
+        r'localStorage\.getItem\(["\']([^"\']+)["\']',
+        r'sessionStorage\.getItem\(["\']([^"\']+)["\']',
+        r'localStorage\[["\']([^"\']+)["\']',
+    ]
+    
+    storage_keys = set()
+    for pattern in storage_patterns:
+        matches = re.findall(pattern, html_content)
+        storage_keys.update(matches)
+    
+    return list(storage_keys)
+
 # --- Función de Rastreo Mejorado ---
-def advanced_crawler(start_url, max_depth=2, max_urls=1000, verify_ssl=True, delay=0, check_robots=True):
+def advanced_crawler_enhanced(start_url, max_depth=2, max_urls=1000, verify_ssl=True, delay=0, check_robots=True):
     """
-    Rastreo avanzado con múltiples mejoras de seguridad y funcionalidad
+    Versión mejorada con detección completa según WSTG
     """
     # Validación de URL
     if not start_url.startswith(('http://', 'https://')):
@@ -301,7 +459,13 @@ def advanced_crawler(start_url, max_depth=2, max_urls=1000, verify_ssl=True, del
         'security_headers': {},
         'technologies': [],
         'robots_txt': {},
-        'js_parameters': []
+        'js_parameters': [],
+        'cookies': [],  # NUEVO
+        'api_endpoints': [],  # NUEVO
+        'custom_headers': [],  # NUEVO
+        'websockets': [],  # NUEVO
+        'storage_keys': [],  # NUEVO
+        'json_payloads': []  # NUEVO
     }
 
     # Verificar robots.txt si está habilitado
@@ -352,8 +516,32 @@ def advanced_crawler(start_url, max_depth=2, max_urls=1000, verify_ssl=True, del
             response = get_page_content(current_url, verify_ssl, delay if not first_request else 0)
             first_request = False
             
-            if response:
+             if response:
                 html_content = response.text
+        
+                # Extraer cookies (NUEVO)
+                cookies = extract_cookies(response)
+                security_info['cookies'].extend(cookies)
+                
+                # Detectar API endpoints (NUEVO)
+                api_endpoints = extract_api_endpoints(html_content)
+                security_info['api_endpoints'].extend(api_endpoints)
+                
+                # Detectar custom headers (NUEVO)
+                custom_headers = extract_custom_headers(html_content)
+                security_info['custom_headers'].extend(custom_headers)
+                
+                # Detectar WebSockets (NUEVO)
+                websockets = detect_websockets(html_content)
+                security_info['websockets'].extend(websockets)
+                
+                # Detectar localStorage usage (NUEVO)
+                storage_keys = detect_localstorage_usage(html_content)
+                security_info['storage_keys'].extend(storage_keys)
+                
+                # Detectar JSON payloads (NUEVO)
+                json_payloads = detect_json_payloads(html_content)
+                security_info['json_payloads'].extend(json_payloads)
                 
                 # Análisis de seguridad en la primera página
                 if current_url == start_url or not security_info['waf_detected']:
@@ -382,7 +570,7 @@ def advanced_crawler(start_url, max_depth=2, max_urls=1000, verify_ssl=True, del
                         urls_to_visit.append((link, current_depth + 1))
                 
                 # Extraer formularios
-                forms = extract_form_inputs(current_url, html_content)
+                forms = extract_enhanced_form_inputs(current_url, html_content)
                 for form in forms:
                     input_type = f"FORM_{form['method']}"
                     discovered_inputs.append({
@@ -403,24 +591,13 @@ def advanced_crawler(start_url, max_depth=2, max_urls=1000, verify_ssl=True, del
         'scan_date': datetime.now().isoformat()
     }
 
+
+
 # --- Funciones de Reporte ---
-def print_report(results):
-    """Imprime un reporte estilizado en consola"""
+def print_report_enhanced(results):
+    """Versión mejorada del reporte"""
     if not results:
         return
-    
-    visited_urls = results['visited_urls']
-    discovered_inputs = results['discovered_inputs']
-    security_info = results['security_info']
-    
-    print(f"\n{Fore.MAGENTA}{'='*60}")
-    print(f"{'REPORTE DE RASTREO':^60}")
-    print(f"{'='*60}{Style.RESET_ALL}")
-    
-    print(f"\n{Fore.YELLOW}📊 Estadísticas:{Style.RESET_ALL}")
-    print(f"  • URLs visitadas: {len(visited_urls)}")
-    print(f"  • Inputs descubiertos: {len(discovered_inputs)}")
-    print(f"  • Fecha del escaneo: {results['scan_date']}")
     
     # Información de seguridad
     print(f"\n{Fore.CYAN}🛡️  Información de Seguridad:{Style.RESET_ALL}")
@@ -446,6 +623,44 @@ def print_report(results):
             print(f"    - {Fore.RED}{header}{Style.RESET_ALL}")
     else:
         print(f"  • Headers de seguridad: {Fore.GREEN}Todos presentes{Style.RESET_ALL}")
+
+      # Nuevas secciones:
+    security_info = results['security_info']
+    
+    print(f"\n{Fore.CYAN}🍪 Cookies Detectadas:{Style.RESET_ALL}")
+    if security_info['cookies']:
+        for cookie in security_info['cookies'][:5]:  # Mostrar primeras 5
+            secure_flag = f"{Fore.GREEN}Secure{Style.RESET_ALL}" if cookie['secure'] else f"{Fore.RED}No Secure{Style.RESET_ALL}"
+            httponly_flag = f"{Fore.GREEN}HttpOnly{Style.RESET_ALL}" if cookie['httponly'] else f"{Fore.RED}No HttpOnly{Style.RESET_ALL}"
+            print(f"  • {cookie['name']}: {secure_flag}, {httponly_flag}")
+    
+    print(f"\n{Fore.CYAN}🔌 API Endpoints:{Style.RESET_ALL}")
+    if security_info['api_endpoints']:
+        for endpoint in security_info['api_endpoints'][:10]:
+            print(f"  • {endpoint}")
+    
+    print(f"\n{Fore.CYAN}📡 WebSockets:{Style.RESET_ALL}")
+    if security_info['websockets']:
+        for ws in security_info['websockets']:
+            print(f"  • {ws}")
+    
+    print(f"\n{Fore.CYAN}💾 LocalStorage Keys:{Style.RESET_ALL}")
+    if security_info['storage_keys']:
+        print(f"  {', '.join(security_info['storage_keys'][:10])}")
+
+    
+    visited_urls = results['visited_urls']
+    discovered_inputs = results['discovered_inputs']
+    security_info = results['security_info']
+    
+    print(f"\n{Fore.MAGENTA}{'='*60}")
+    print(f"{'REPORTE DE RASTREO':^60}")
+    print(f"{'='*60}{Style.RESET_ALL}")
+    
+    print(f"\n{Fore.YELLOW}📊 Estadísticas:{Style.RESET_ALL}")
+    print(f"  • URLs visitadas: {len(visited_urls)}")
+    print(f"  • Inputs descubiertos: {len(discovered_inputs)}")
+    print(f"  • Fecha del escaneo: {results['scan_date']}")
     
     # Parámetros en JavaScript
     if security_info['js_parameters']:
