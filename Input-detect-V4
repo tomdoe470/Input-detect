@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Input-detectorV3-playwright.py
+Versión extendida del detector de inputs que integra:
+  - Renderizado de JavaScript con Playwright (headless)
+  - Fallback a Selenium si Playwright no está disponible
+  - Análisis estático de JS (heurísticas)
+  - Búsqueda de endpoints API y rutas de SPA
+  - Modo híbrido: HTML estático + DOM renderizado y comparación
+
+Uso:
+  python Input-detectorV3-playwright.py -u https://example.com --headless
+  python Input-detectorV3-playwright.py -u https://example.com --no-render --static-only
+
+Dependencias recomendadas:
+  pip install requests beautifulsoup4 colorama playwright
+  # luego: playwright install
+
+Si preferís Selenium en vez de Playwright:
+  pip install selenium webdriver-manager
+
+NOTA: Asegurate de tener autorización antes de escanear cualquier sitio.
+"""
+
+import argparse
+import json
+import logging
+import random
+import re
+import sys
+import time
+from datetime import datetime
+from urllib.parse import urljoin, urlparse, parse_qs
+
+import requests
+from bs4 import BeautifulSoup
+from colorama import Fore, Style, init
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Inicializar colorama
+init(autoreset=True)
+
+# ----- Configuración -----
+USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+]
+BASE_HEADERS = {
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept-Language': 'es-ES,es;q=0.9',
+    'DNT': '1',
+    'Connection': 'keep-alive',
+}
+EXCLUDED_EXTENSIONS = ['.pdf', '.zip', '.exe', '.jpg', '.jpeg', '.png', '.gif', '.mp4', '.mp3', '.css', '.ico', '.svg', '.woff', '.woff2', '.ttf']
+MAX_URLS_DEFAULT = 1000
+MAX_DEPTH_DEFAULT = 2
+SECURITY_HEADERS = [
+    'Strict-Transport-Security', 'Content-Security-Policy', 'X-Frame-Options',
+    'X-Content-Type-Options', 'X-XSS-Protection', 'Referrer-Policy'
+]
+
+# ----- Session HTTP con retries -----
+session = requests.Session()
+retries = Retry(total=3, backoff_factor=0.6, status_forcelist=[429, 500, 502, 503, 504])
+adapter = HTTPAdapter(max_retries=retries)
+session.mount('http://', adapter)
+session.mount('https://', adapter)
+
+# ----- Optional browser integrations -----
+HAS_PLAYWRIGHT = False
+HAS_SELENIUM = False
+
+try:
+    from playwright.sync_api import sync_playwright
+    HAS_PLAYWRIGHT = True
+except Exception:
+    HAS_PLAYWRIGHT = False
+
+if not HAS_PLAYWRIGHT:
+    try:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.options import Options as ChromeOptions
+        from webdriver_manager.chrome import ChromeDriverManager
+        HAS_SELENIUM = True
+    except Exception:
+        HAS_SELENIUM = False
+
+# ----- Logging -----
+
+def setup_logging(quiet_mode=False, log_file=None):
+    if log_file:
+        handlers = [logging.FileHandler(log_file), logging.StreamHandler() if not quiet_mode else logging.NullHandler()]
+        logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=handlers)
+    else:
+        level = logging.WARNING if quiet_mode else logging.INFO
+        logging.basicConfig(level=level, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ----- Utilidades -----
+
+def should_skip_url(url):
+    try:
+        p = urlparse(url)
+        path = p.path.lower()
+        return any(path.endswith(ext) for ext in EXCLUDED_EXTENSIONS)
+    except Exception:
+        return True
+
+
+def is_same_netloc(url1, url2):
+    return urlparse(url1).netloc == urlparse(url2).netloc
+
+
+def random_headers():
+    h = BASE_HEADERS.copy()
+    h['User-Agent'] = random.choice(USER_AGENTS)
+    return h
+
+# ----- Heurísticas de análisis -----
+
+def extract_internal_links(base_url, html_content):
+    links = set()
+    if not html_content:
+        return links
+    soup = BeautifulSoup(html_content, 'html.parser')
+    base_netloc = urlparse(base_url).netloc
+    for a in soup.find_all('a', href=True):
+        href = a['href'].strip()
+        if not href:
+            continue
+        full = urljoin(base_url, href)
+        parsed = urlparse(full)
+        if parsed.scheme not in ('http', 'https'):
+            continue
+        if parsed.netloc != base_netloc:
+            continue
+        if should_skip_url(full):
+            continue
+        normalized = parsed.scheme + '://' + parsed.netloc + parsed.path
+        if parsed.query:
+            normalized += '?' + parsed.query
+        links.add(normalized)
+    return links
+
+
+def extract_forms(base_url, html_content):
+    forms = []
+    if not html_content:
+        return forms
+    soup = BeautifulSoup(html_content, 'html.parser')
+    for form in soup.find_all('form'):
+        action = form.get('action', '')
+        full_action = urljoin(base_url, action)
+        method = form.get('method', 'GET').upper()
+        inputs = []
+        for tag in form.find_all(['input', 'textarea', 'select', 'button']):
+            name = tag.get('name')
+            if not name:
+                continue
+            t = tag.get('type', 'text')
+            inputs.append({'name': name, 'type': t, 'value': tag.get('value', '')})
+        if inputs:
+            forms.append({'action': full_action, 'method': method, 'fields': inputs})
+    return forms
+
+
+def extract_js_endpoints(html_text):
+    eps = set()
+    if not html_text:
+        return list(eps)
+    patterns = [r"fetch\(\s*['\"]([^'\"]+)['\"]",
+                r"axios\.[a-zA-Z]+\(\s*['\"]([^'\"]+)['\"]",
+                r"\b['\"](/api/[a-zA-Z0-9_\-/{}]+)['\"]",
+                r"\b['\"](/v\d+/[a-zA-Z0-9_\-/{}]+)['\"]"]
+    for p in patterns:
+        for m in re.findall(p, html_text, flags=re.IGNORECASE):
+            eps.add(m)
+    return sorted(list(eps))
+
+
+def detect_js_params(html_text):
+    if not html_text:
+        return []
+    patterns = [r'[\?&]([a-zA-Z_][a-zA-Z0-9_]*)=', r"params\[\s*['\"]([^'\"]+)['\"]\]"]
+    found = set()
+    for pat in patterns:
+        for m in re.findall(pat, html_text):
+            found.add(m)
+    return sorted(list(found))
+
+# ----- Page retrieval (static) -----
+
+def get_page_static(url, verify_ssl=True, delay=0, quiet=False):
+    try:
+        if delay > 0:
+            time.sleep(delay)
+        headers = random_headers()
+        if not quiet:
+            print(f"{Fore.CYAN}[*] GET static: {url}{Style.RESET_ALL}")
+        r = session.get(url, headers=headers, timeout=12, verify=verify_ssl)
+        r.raise_for_status()
+        return r
+    except Exception as e:
+        logging.error(f"Static request error for {url}: {e}")
+        if not quiet:
+            print(f"{Fore.RED}[-] Error GET {url}: {e}{Style.RESET_ALL}")
+        return None
+
+# ----- Page retrieval (rendered) using Playwright -----
+def render_with_playwright(url, wait_for=2, timeout=20000, headless=True, no_images=True):
+    if not HAS_PLAYWRIGHT:
+        raise RuntimeError('Playwright no está instalado en este entorno')
+    result = {'html': '', 'url': url}
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=headless)
+        context = browser.new_context(java_script_enabled=True)
+        page = context.new_page()
+        try:
+            # Block images optionally to speed up
+            if no_images:
+                page.route('**/*', lambda route, request: route.abort() if request.resource_type == 'image' else route.continue_())
+            page.goto(url, timeout=timeout)
+            time.sleep(wait_for)
+            # obtener HTML renderizado
+            result['html'] = page.content()
+            result['url'] = page.url
+        finally:
+            context.close()
+            browser.close()
+    return result
+
+# ----- Page retrieval (rendered) using Selenium fallback -----
+def render_with_selenium(url, wait_for=2, headless=True):
+    if not HAS_SELENIUM:
+        raise RuntimeError('Selenium no está disponible en este entorno')
+    opts = ChromeOptions()
+    if headless:
+        opts.add_argument('--headless=new')
+    opts.add_argument('--no-sandbox')
+    opts.add_argument('--disable-dev-shm-usage')
+    opts.add_argument('--disable-gpu')
+    opts.add_argument('--window-size=1920,1080')
+    driver = webdriver.Chrome(ChromeDriverManager().install(), options=opts)
+    try:
+        driver.get(url)
+        time.sleep(wait_for)
+        html = driver.page_source
+        cur = driver.current_url
+    finally:
+        driver.quit()
+    return {'html': html, 'url': cur}
+
+# ----- Crawler híbrido que combina estático + renderizado -----
+
+def hybrid_crawl(start_url, max_depth=2, max_urls=500, verify_ssl=True, delay=0.5, render=True, render_engine='playwright', headless=True, quiet=False):
+    start_url = start_url.rstrip('/')
+    visited = set()
+    to_visit = [(start_url, 0)]
+    discovered = []
+    security = {'api_endpoints': set(), 'js_params': set(), 'cookies': [], 'technologies': set(), 'websockets': set()}
+
+    while to_visit and len(visited) < max_urls:
+        url, depth = to_visit.pop(0)
+        if url in visited or depth > max_depth:
+            continue
+        if should_skip_url(url):
+            visited.add(url)
+            continue
+        print(f"{Fore.BLUE}[+] Visitando: {url} (profundidad {depth}){Style.RESET_ALL}")
+        visited.add(url)
+
+        # 1) GET estático
+        resp = get_page_static(url, verify_ssl=verify_ssl, delay=delay, quiet=quiet)
+        static_html = resp.text if resp else ''
+        if resp:
+            # cookies
+            for c in resp.cookies:
+                security['cookies'].append({'name': getattr(c, 'name', ''), 'domain': getattr(c, 'domain', ''), 'secure': getattr(c, 'secure', False)})
+            # static heuristics
+            for ep in extract_js_endpoints(static_html):
+                security['api_endpoints'].add(ep)
+            for p in detect_js_params(static_html):
+                security['js_params'].add(p)
+            forms = extract_forms(url, static_html)
+            for f in forms:
+                discovered.append({'url': url, 'type': 'FORM_STATIC', 'form': f})
+
+        # 2) Renderizado con headless (opcional)
+        rendered_html = ''
+        rendered_url = url
+        if render:
+            try:
+                if render_engine == 'playwright' and HAS_PLAYWRIGHT:
+                    r = render_with_playwright(url, wait_for=2, headless=headless)
+                    rendered_html = r.get('html', '')
+                    rendered_url = r.get('url', url)
+                elif render_engine == 'selenium' and HAS_SELENIUM:
+                    r = render_with_selenium(url, wait_for=2, headless=headless)
+                    rendered_html = r.get('html', '')
+                    rendered_url = r.get('url', url)
+                else:
+                    # fallback: try Playwright if available, else selenium
+                    if HAS_PLAYWRIGHT:
+                        r = render_with_playwright(url, wait_for=2, headless=headless)
+                        rendered_html = r.get('html', '')
+                        rendered_url = r.get('url', url)
+                    elif HAS_SELENIUM:
+                        r = render_with_selenium(url, wait_for=2, headless=headless)
+                        rendered_html = r.get('html', '')
+                        rendered_url = r.get('url', url)
+                    else:
+                        if not quiet:
+                            print(f"{Fore.YELLOW}[!] No hay motor de render instalado (Playwright/Selenium). Omitiendo renderizado.{Style.RESET_ALL}")
+            except Exception as e:
+                logging.error(f"Render error for {url}: {e}")
+                if not quiet:
+                    print(f"{Fore.RED}[-] Error renderizando {url}: {e}{Style.RESET_ALL}")
+
+            # analizar DOM renderizado
+            if rendered_html:
+                # extract forms rendered dynamically
+                forms_r = extract_forms(rendered_url, rendered_html)
+                for f in forms_r:
+                    discovered.append({'url': rendered_url, 'type': 'FORM_RENDERED', 'form': f})
+                # extract endpoints
+                for ep in extract_js_endpoints(rendered_html):
+                    security['api_endpoints'].add(ep)
+                for p in detect_js_params(rendered_html):
+                    security['js_params'].add(p)
+
+        # 3) extract links from both static and rendered content
+        links = set()
+        links.update(extract_internal_links(url, static_html))
+        if rendered_html:
+            links.update(extract_internal_links(rendered_url, rendered_html))
+
+        for l in sorted(list(links)):
+            if l not in visited and len(visited) + len(to_visit) < max_urls:
+                to_visit.append((l, depth + 1))
+
+    # Normalize and prepare output
+    security['api_endpoints'] = sorted(list(security['api_endpoints']))
+    security['js_params'] = sorted(list(security['js_params']))
+
+    return {
+        'visited_urls': sorted(list(visited)),
+        'discovered_inputs': discovered,
+        'security_info': security,
+        'scan_date': datetime.now().isoformat()
+    }
+
+# ----- CLI -----
+
+def main():
+    parser = argparse.ArgumentParser(description='Input detector con render headless (Playwright/Selenium)')
+    parser.add_argument('-u', '--url', required=True, help='URL objetivo')
+    parser.add_argument('-d', '--depth', type=int, default=MAX_DEPTH_DEFAULT, help='Profundidad de rastreo')
+    parser.add_argument('--max-urls', type=int, default=MAX_URLS_DEFAULT, help='Max URLs')
+    parser.add_argument('--delay', type=float, default=0.5, help='Delay entre requests')
+    parser.add_argument('--no-verify', action='store_true', help='No verificar SSL')
+    parser.add_argument('--no-robots', action='store_true', help='Ignorar robots.txt (NO recomendado)')
+    parser.add_argument('--no-render', action='store_true', help='No ejecutar render headless')
+    parser.add_argument('--engine', choices=['playwright', 'selenium', 'auto'], default='auto', help='Motor de render a usar')
+    parser.add_argument('--headless', action='store_true', help='Ejecutar browser en headless (default: True si --headless presente)')
+    parser.add_argument('--static-only', action='store_true', help='Solo análisis estático (no render ni JS)')
+    parser.add_argument('--export', choices=['json', 'txt'], help='Exportar resultados')
+    parser.add_argument('-o', '--output', help='Archivo de salida')
+    parser.add_argument('--log', help='Archivo de log')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Modo silencioso')
+
+    args = parser.parse_args()
+
+    setup_logging(quiet_mode=args.quiet, log_file=args.log)
+
+    if args.static_only:
+        render = False
+    else:
+        render = not args.no_render
+
+    # Elegir motor de render
+    engine = args.engine
+    if engine == 'auto':
+        if HAS_PLAYWRIGHT:
+            engine = 'playwright'
+        elif HAS_SELENIUM:
+            engine = 'selenium'
+        else:
+            engine = None
+
+    if not engine and render:
+        print(f"{Fore.YELLOW}[!] No hay motor de render disponible. Ejecutando en modo estático.{Style.RESET_ALL}")
+        render = False
+
+    print(f"{Fore.GREEN}Starting scan: {args.url}{Style.RESET_ALL}")
+    results = hybrid_crawl(
+        start_url=args.url,
+        max_depth=args.depth,
+        max_urls=args.max_urls,
+        verify_ssl=not args.no_verify,
+        delay=args.delay,
+        render=render,
+        render_engine=engine,
+        headless=args.headless or True,
+        quiet=args.quiet
+    )
+
+    # Mostrar resumen
+    if not args.quiet:
+        print('\n' + '='*60)
+        print('Scan results:')
+        print(f"Visited URLs: {len(results['visited_urls'])}")
+        print(f"Discovered inputs: {len(results['discovered_inputs'])}")
+        print(f"API endpoints found: {len(results['security_info'].get('api_endpoints', []))}")
+        print('='*60 + '\n')
+
+    # Export
+    if args.export:
+        out = args.output or f"scan_{int(time.time())}.{args.export}"
+        try:
+            if args.export == 'json':
+                with open(out, 'w', encoding='utf-8') as f:
+                    json.dump(results, f, indent=2, ensure_ascii=False)
+            else:
+                with open(out, 'w', encoding='utf-8') as f:
+                    f.write(json.dumps(results, indent=2, ensure_ascii=False))
+            print(f"{Fore.GREEN}[+] Results exported to {out}{Style.RESET_ALL}")
+        except Exception as e:
+            print(f"{Fore.RED}[-] Error exporting results: {e}{Style.RESET_ALL}")
+
+if __name__ == '__main__':
+    main()
